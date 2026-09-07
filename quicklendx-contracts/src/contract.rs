@@ -2,9 +2,10 @@ use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Vec, Bytes, xdr:
 use crate::admin::AdminStorage;
 use crate::errors::QuickLendXError;
 use crate::protocol_limits::{
-    check_and_record_mutation, check_and_record_kyc_submission, require_batch_size_bound,
-    require_description_bound, require_kyc_data_bound, require_rating_comment_bound,
-    require_status_batch_bound, require_tags_bound,
+    check_and_record_identity_transition, check_and_record_kyc_submission,
+    check_and_record_mutation, require_batch_size_bound, require_description_bound,
+    require_kyc_data_bound, require_rating_comment_bound, require_status_batch_bound,
+    require_tags_bound,
 };
 use crate::types::{
     Invoice, InvoiceStatus, InvoiceCategory, InvoiceMetadata, Bid, BidStatus,
@@ -403,8 +404,8 @@ impl QuickLendXContract {
     }
 
     pub fn verify_business(env: Env, admin: Address, business: Address) -> Result<(), QuickLendXError> {
-        // #2479 – per-admin identity transition rate limit
-        check_and_record_mutation(&env, &admin)?;
+        // #2479 – per-admin identity transition rate limit (stricter than mutation limiter)
+        check_and_record_identity_transition(&env, &admin)?;
         verify_business(&env, &admin, &business)
     }
 
@@ -415,14 +416,16 @@ impl QuickLendXContract {
         business: Address,
         reason: soroban_sdk::String,
     ) -> Result<(), QuickLendXError> {
-        // #2479 – per-admin identity transition rate limit
-        check_and_record_mutation(&env, &admin)?;
+        // #2479 – per-admin identity transition rate limit (stricter than mutation limiter)
+        check_and_record_identity_transition(&env, &admin)?;
         verification_reject_business(&env, &admin, &business, reason)
     }
 
     /// Delete a business, removing it from any status list and marking as deleted.
     pub fn delete_business(env: Env, business: Address) -> Result<(), QuickLendXError> {
         crate::governance::require_no_open_governance_proposal(&env)?;
+        // #2479 – per-address rate limit (prevents unbounded identity removal)
+        check_and_record_mutation(&env, &business)?;
         BusinessVerificationStorage::delete_business(&env, &business)
     }
 
@@ -436,8 +439,12 @@ impl QuickLendXContract {
         InvestorVerificationStorage::submit(&env, &investor, kyc_data)
     }
 
-    pub fn verify_investor(env: Env, investor: Address, limit: i128) {
-        InvestorVerificationStorage::verify_investor(&env, &investor, limit);
+    pub fn verify_investor(env: Env, admin: Address, investor: Address, limit: i128) -> Result<(), QuickLendXError> {
+        // #2479 – per-admin identity transition rate limit (stricter than mutation limiter)
+        check_and_record_identity_transition(&env, &admin)?;
+        // Delegate to verification module which enforces admin auth + state transition
+        crate::verification::verify_investor(&env, &admin, &investor, limit)?;
+        Ok(())
     }
 
     /// Reject a pending investor KYC application with an auditable reason.
@@ -447,8 +454,8 @@ impl QuickLendXContract {
         investor: Address,
         reason: soroban_sdk::String,
     ) -> Result<(), QuickLendXError> {
-        // #2479 – per-admin identity transition rate limit
-        check_and_record_mutation(&env, &admin)?;
+        // #2479 – per-admin identity transition rate limit (stricter than mutation limiter)
+        check_and_record_identity_transition(&env, &admin)?;
         verification_reject_investor(&env, &admin, &investor, reason)
     }
 
@@ -459,8 +466,8 @@ impl QuickLendXContract {
         investor: Address,
         reason: soroban_sdk::String,
     ) -> Result<(), QuickLendXError> {
-        // #2479 – per-admin identity transition rate limit
-        check_and_record_mutation(&env, &admin)?;
+        // #2479 – per-admin identity transition rate limit (stricter than mutation limiter)
+        check_and_record_identity_transition(&env, &admin)?;
         verification_revoke_investor_kyc(&env, &admin, &investor, reason)
     }
 

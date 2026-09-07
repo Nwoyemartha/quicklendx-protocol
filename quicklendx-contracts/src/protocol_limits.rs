@@ -738,6 +738,124 @@ pub fn check_and_record_kyc_submission(env: &Env, addr: &Address) -> Result<(), 
     Ok(())
 }
 
+// ─── Per-admin identity transition rate limiter (#2479) ────────────────────
+// Tracks the number of KYC identity-transition operations (verify, reject,
+// revoke) that a single admin address may perform within a sliding
+// ledger-sequence window.  This is stricter than the general mutation rate
+// limiter because identity transitions are high-impact operations that
+// change participant eligibility: an admin who can verify/reject unlimited
+// participants in a single window could silently enable a wave of
+// illegitimate activity.
+//
+// Storage layout (all under `Instance`):
+//
+//   `id_rate:{address}`  → IdentityTransitionRateRecord
+
+/// Number of consecutive ledger sequences that form one identity-transition
+/// rate-limit window.
+pub const IDENTITY_RATE_LIMIT_WINDOW_SEQUENCES: u32 = 15;
+/// Maximum identity-transition operations (verify / reject / revoke) any
+/// single admin address may issue within one window.
+pub const MAX_IDENTITY_TRANSITIONS_PER_WINDOW: u32 = 10;
+
+/// Persistent record for per-admin identity-transition accounting.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IdentityTransitionRateRecord {
+    /// Ledger sequence at which the current window started.
+    pub window_start: u32,
+    /// Number of identity-transition operations observed in this window.
+    pub count: u32,
+}
+
+impl Default for IdentityTransitionRateRecord {
+    fn default() -> Self {
+        Self {
+            window_start: 0,
+            count: 0,
+        }
+    }
+}
+
+/// Internal storage key for identity-transition-rate records.
+fn identity_rate_key(_env: &Env, addr: &Address) -> (soroban_sdk::Symbol, Address) {
+    (soroban_sdk::symbol_short!("id_rate"), addr.clone())
+}
+
+/// Read the current identity-transition rate-record for `addr`.
+fn read_identity_rate_record(env: &Env, addr: &Address) -> IdentityTransitionRateRecord {
+    let key = identity_rate_key(env, addr);
+    env.storage()
+        .instance()
+        .get(&key)
+        .unwrap_or(IdentityTransitionRateRecord::default())
+}
+
+/// Write the identity-transition rate-record for `addr`.
+fn write_identity_rate_record(env: &Env, addr: &Address, record: &IdentityTransitionRateRecord) {
+    let key = identity_rate_key(env, addr);
+    env.storage().instance().set(&key, record);
+}
+
+/// Check whether `addr` has exceeded the per-window identity-transition limit.
+///
+/// This is a **pure read** — it does *not* increment the counter.
+pub fn check_identity_transition_limit(
+    env: &Env,
+    addr: &Address,
+) -> Result<(), QuickLendXError> {
+    let current_seq = env.ledger().sequence();
+    let record = read_identity_rate_record(env, addr);
+
+    // Window expired → counter implicitly resets (lazy reset).
+    if record.window_start == 0
+        || current_seq > record.window_start + IDENTITY_RATE_LIMIT_WINDOW_SEQUENCES
+    {
+        return Ok(());
+    }
+
+    if record.count >= MAX_IDENTITY_TRANSITIONS_PER_WINDOW {
+        return Err(QuickLendXError::MutationLimitExceeded);
+    }
+
+    Ok(())
+}
+
+/// Record one identity-transition operation for `addr` after the state
+/// change has been committed.
+///
+/// If the window has expired the counter resets lazily.
+pub fn record_identity_transition(env: &Env, addr: &Address) {
+    let current_seq = env.ledger().sequence();
+    let mut record = read_identity_rate_record(env, addr);
+
+    if record.window_start == 0
+        || current_seq > record.window_start + IDENTITY_RATE_LIMIT_WINDOW_SEQUENCES
+    {
+        record = IdentityTransitionRateRecord {
+            window_start: current_seq,
+            count: 1,
+        };
+    } else {
+        record.count = record.count.saturating_add(1);
+    }
+
+    write_identity_rate_record(env, addr, &record);
+}
+
+/// Convenience: check-then-record an identity-transition in a single call.
+///
+/// Use this at the top of an admin identity-transition entrypoint *before*
+/// any storage writes.
+pub fn check_and_record_identity_transition(
+    env: &Env,
+    addr: &Address,
+) -> Result<(), QuickLendXError> {
+    check_identity_transition_limit(env, addr)?;
+    record_identity_transition(env, addr);
+    Ok(())
+}
+
 // ─── Test helpers ───────────────────────────────────────────────────────────
 
 /// Read the current mutation rate record for `addr` (test only).
@@ -747,4 +865,19 @@ pub fn check_and_record_kyc_submission(env: &Env, addr: &Address) -> Result<(), 
 #[cfg(test)]
 pub fn read_mutation_rate_record_for_test(env: &Env, addr: &Address) -> MutationRateRecord {
     read_rate_record(env, addr)
+}
+
+/// Read the current KYC rate record for `addr` (test only).
+#[cfg(test)]
+pub fn read_kyc_rate_record_for_test(env: &Env, addr: &Address) -> KycRateRecord {
+    read_kyc_rate_record(env, addr)
+}
+
+/// Read the current identity-transition rate record for `addr` (test only).
+#[cfg(test)]
+pub fn read_identity_rate_record_for_test(
+    env: &Env,
+    addr: &Address,
+) -> IdentityTransitionRateRecord {
+    read_identity_rate_record(env, addr)
 }
