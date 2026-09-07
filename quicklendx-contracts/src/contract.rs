@@ -2,8 +2,9 @@ use soroban_sdk::{contract, contractimpl, Address, BytesN, Env, Vec, Bytes, xdr:
 use crate::admin::AdminStorage;
 use crate::errors::QuickLendXError;
 use crate::protocol_limits::{
-    check_and_record_mutation, require_batch_size_bound, require_description_bound,
-    require_kyc_data_bound, require_status_batch_bound, require_tags_bound,
+    check_and_record_mutation, check_and_record_kyc_submission, require_batch_size_bound,
+    require_description_bound, require_kyc_data_bound, require_rating_comment_bound,
+    require_status_batch_bound, require_tags_bound,
 };
 use crate::types::{
     Invoice, InvoiceStatus, InvoiceCategory, InvoiceMetadata, Bid, BidStatus,
@@ -13,7 +14,7 @@ use crate::types::{
 use crate::storage::InvoiceStorage;
 use crate::init::{ProtocolInitializer, InitializationParams};
 use crate::protocol_limits::ProtocolLimitsContract;
-use crate::verification::{BusinessVerificationStorage, InvestorVerificationStorage, submit_kyc_application, verify_business};
+use crate::verification::{BusinessVerificationStorage, InvestorVerificationStorage, submit_kyc_application, verify_business, reject_business as verification_reject_business, reject_investor as verification_reject_investor, revoke_investor_kyc as verification_revoke_investor_kyc};
 use crate::bid::BidStorage;
 use crate::payments::EscrowStorage;
 use crate::backup::{Backup, BackupStorage, BackupStatus, BackupRetentionPolicy};
@@ -357,9 +358,12 @@ impl QuickLendXContract {
     }
 
     pub fn submit_kyc_application(env: Env, business: Address, kyc_data: soroban_sdk::Bytes) -> Result<(), QuickLendXError> {
-        // #2439 – input-size ceiling before any expensive work
+        // #2479 – input-size ceiling before any expensive work
         require_kyc_data_bound(&kyc_data)?;
+        // #2439 – per-address general mutation rate limit
         check_and_record_mutation(&env, &business)?;
+        // #2479 – per-participant KYC submission rate limit (prevents resubmission spam)
+        check_and_record_kyc_submission(&env, &business)?;
         submit_kyc_application(&env, &business, kyc_data)
     }
 
@@ -399,7 +403,21 @@ impl QuickLendXContract {
     }
 
     pub fn verify_business(env: Env, admin: Address, business: Address) -> Result<(), QuickLendXError> {
+        // #2479 – per-admin identity transition rate limit
+        check_and_record_mutation(&env, &admin)?;
         verify_business(&env, &admin, &business)
+    }
+
+    /// Reject a pending business KYC application with an auditable reason.
+    pub fn reject_business(
+        env: Env,
+        admin: Address,
+        business: Address,
+        reason: soroban_sdk::String,
+    ) -> Result<(), QuickLendXError> {
+        // #2479 – per-admin identity transition rate limit
+        check_and_record_mutation(&env, &admin)?;
+        verification_reject_business(&env, &admin, &business, reason)
     }
 
     /// Delete a business, removing it from any status list and marking as deleted.
@@ -409,14 +427,41 @@ impl QuickLendXContract {
     }
 
     pub fn submit_investor_kyc(env: Env, investor: Address, kyc_data: soroban_sdk::Bytes) -> Result<(), QuickLendXError> {
-        // #2439 – input-size ceiling
+        // #2479 – input-size ceiling
         require_kyc_data_bound(&kyc_data)?;
+        // #2439 – per-address general mutation rate limit
         check_and_record_mutation(&env, &investor)?;
+        // #2479 – per-participant KYC submission rate limit (prevents resubmission spam)
+        check_and_record_kyc_submission(&env, &investor)?;
         InvestorVerificationStorage::submit(&env, &investor, kyc_data)
     }
 
     pub fn verify_investor(env: Env, investor: Address, limit: i128) {
         InvestorVerificationStorage::verify_investor(&env, &investor, limit);
+    }
+
+    /// Reject a pending investor KYC application with an auditable reason.
+    pub fn reject_investor(
+        env: Env,
+        admin: Address,
+        investor: Address,
+        reason: soroban_sdk::String,
+    ) -> Result<(), QuickLendXError> {
+        // #2479 – per-admin identity transition rate limit
+        check_and_record_mutation(&env, &admin)?;
+        verification_reject_investor(&env, &admin, &investor, reason)
+    }
+
+    /// Revoke a previously-verified investor's KYC (admin only).
+    pub fn revoke_investor_kyc(
+        env: Env,
+        admin: Address,
+        investor: Address,
+        reason: soroban_sdk::String,
+    ) -> Result<(), QuickLendXError> {
+        // #2479 – per-admin identity transition rate limit
+        check_and_record_mutation(&env, &admin)?;
+        verification_revoke_investor_kyc(&env, &admin, &investor, reason)
     }
 
     pub fn get_available_invoices(env: Env) -> Vec<BytesN<32>> {
@@ -515,6 +560,8 @@ impl QuickLendXContract {
         comment: soroban_sdk::Bytes,
         investor: Address,
     ) -> Result<(), QuickLendXError> {
+        // #2479 – hard input-size ceiling on comment before expensive processing
+        require_rating_comment_bound(&comment)?;
         let mut invoice = InvoiceStorage::get(&env, &invoice_id).ok_or(QuickLendXError::InvoiceNotFound)?;
         invoice.add_rating(rating, comment, investor, env.ledger().timestamp())?;
         InvoiceStorage::update_invoice(&env, &invoice);

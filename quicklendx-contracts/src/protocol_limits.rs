@@ -36,6 +36,8 @@ pub const MAX_INPUT_BATCH_SIZE: u32 = 25;
 pub const MAX_INPUT_STATUS_BATCH_SIZE: u32 = 100;
 /// Hard ceiling on the number of line items in a single metadata update.
 pub const MAX_INPUT_LINE_ITEMS: u32 = 50;
+/// Hard ceiling on the rating comment field passed to `add_invoice_rating`.
+pub const MAX_INPUT_RATING_COMMENT_BYTES: u32 = 2_048;
 
 // ─── Per-address mutation rate limiter (#2439) ──────────────────────────────
 // A simple sliding-window counter keyed on (address, ledger_sequence).
@@ -619,4 +621,130 @@ pub fn require_line_items_bound<T>(items: &soroban_sdk::Vec<T>) -> Result<(), Qu
         return Err(QuickLendXError::InputTooLarge);
     }
     Ok(())
+}
+
+/// Reject a rating comment blob that exceeds [`MAX_INPUT_RATING_COMMENT_BYTES`].
+pub fn require_rating_comment_bound(data: &soroban_sdk::Bytes) -> Result<(), QuickLendXError> {
+    if data.len() as u32 > MAX_INPUT_RATING_COMMENT_BYTES {
+        return Err(QuickLendXError::InputTooLarge);
+    }
+    Ok(())
+}
+
+// ─── Per-participant KYC submission rate limiter (#2479) ────────────────────
+// Tracks the number of KYC submission/resubmission attempts within a sliding
+// ledger-sequence window. This is separate from the general mutation rate
+// limiter because KYC submissions are higher-cost (write verification
+// records, emit audit events) and targeted abuse (rapid resubmission after
+// rejection) is a distinct threat model.
+//
+// Storage layout (all under `Instance`):
+//
+//   `kyc_rate:{address}`  → KycRateRecord
+
+/// Number of consecutive ledger sequences that form one KYC rate-limit window.
+pub const KYC_RATE_LIMIT_WINDOW_SEQUENCES: u32 = 10;
+/// Maximum KYC submission/resubmission attempts any single address may issue
+/// within one window.
+pub const MAX_KYC_SUBMISSIONS_PER_WINDOW: u32 = 3;
+
+/// Persistent record for per-address KYC submission accounting.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct KycRateRecord {
+    /// Ledger sequence at which the current window started.
+    pub window_start: u32,
+    /// Number of KYC submissions observed in this window.
+    pub count: u32,
+}
+
+impl Default for KycRateRecord {
+    fn default() -> Self {
+        Self {
+            window_start: 0,
+            count: 0,
+        }
+    }
+}
+
+/// Internal storage key for KYC-rate records.
+fn kyc_rate_key(_env: &Env, addr: &Address) -> (soroban_sdk::Symbol, Address) {
+    (soroban_sdk::symbol_short!("kyc_rate"), addr.clone())
+}
+
+/// Read the current KYC rate-record for `addr`.
+fn read_kyc_rate_record(env: &Env, addr: &Address) -> KycRateRecord {
+    let key = kyc_rate_key(env, addr);
+    env.storage()
+        .instance()
+        .get(&key)
+        .unwrap_or(KycRateRecord::default())
+}
+
+/// Write the KYC rate-record for `addr`.
+fn write_kyc_rate_record(env: &Env, addr: &Address, record: &KycRateRecord) {
+    let key = kyc_rate_key(env, addr);
+    env.storage().instance().set(&key, record);
+}
+
+/// Check whether `addr` has exceeded the per-window KYC submission limit.
+///
+/// This is a **pure read** — it does *not* increment the counter.
+pub fn check_kyc_submission_limit(env: &Env, addr: &Address) -> Result<(), QuickLendXError> {
+    let current_seq = env.ledger().sequence();
+    let record = read_kyc_rate_record(env, addr);
+
+    // Window expired → counter implicitly resets (lazy reset).
+    if record.window_start == 0
+        || current_seq > record.window_start + KYC_RATE_LIMIT_WINDOW_SEQUENCES
+    {
+        return Ok(());
+    }
+
+    if record.count >= MAX_KYC_SUBMISSIONS_PER_WINDOW {
+        return Err(QuickLendXError::MutationLimitExceeded);
+    }
+
+    Ok(())
+}
+
+/// Record one KYC submission for `addr` after the submission has been committed.
+///
+/// If the window has expired the counter resets lazily.
+pub fn record_kyc_submission(env: &Env, addr: &Address) {
+    let current_seq = env.ledger().sequence();
+    let mut record = read_kyc_rate_record(env, addr);
+
+    if record.window_start == 0
+        || current_seq > record.window_start + KYC_RATE_LIMIT_WINDOW_SEQUENCES
+    {
+        record = KycRateRecord {
+            window_start: current_seq,
+            count: 1,
+        };
+    } else {
+        record.count = record.count.saturating_add(1);
+    }
+
+    write_kyc_rate_record(env, addr, &record);
+}
+
+/// Convenience: check-then-record a KYC submission in a single call.
+///
+/// Use this at the top of a KYC entrypoint *before* any storage writes.
+pub fn check_and_record_kyc_submission(env: &Env, addr: &Address) -> Result<(), QuickLendXError> {
+    check_kyc_submission_limit(env, addr)?;
+    record_kyc_submission(env, addr);
+    Ok(())
+}
+
+// ─── Test helpers ───────────────────────────────────────────────────────────
+
+/// Read the current mutation rate record for `addr` (test only).
+///
+/// Exposed so that tests can verify the internal record state without
+/// requiring the full contract client infrastructure.
+#[cfg(test)]
+pub fn read_mutation_rate_record_for_test(env: &Env, addr: &Address) -> MutationRateRecord {
+    read_rate_record(env, addr)
 }

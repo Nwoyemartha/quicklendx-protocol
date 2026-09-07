@@ -1,6 +1,8 @@
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, Env, Symbol, symbol_short};
+extern crate alloc;
+
+use soroban_sdk::{contract, contractimpl, symbol_short, Env, Symbol};
 
 pub mod errors;
 /// Invoice amount precision and overflow validation (Issue #2432).
@@ -13,6 +15,8 @@ pub mod invoice_amount;
 
 #[cfg(test)]
 mod test_invoice_amount_precision;
+#[cfg(test)]
+mod test_resource_rate_limits;
 
 #[contract]
 pub struct QuickLendXContract;
